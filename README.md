@@ -1,2 +1,3 @@
 # Metabarcoding-analysis
-Pipeline to perform rRNA 16S analysis based on DADA2 
+Code for reproducing results in the paper: EFFECTS OF HUMAN-ANIMAL RELATIONSHIP QUALITY ON FECAL MICROBIOTA COMPOSITION 
+#AND IMMUNE RESPONSE OF PIGS
