@@ -1,0 +1,211 @@
+---
+title: "Denoising_ASVs_DADA2"
+output: html_document
+date: "2023-07-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+R version 4.2.1 (2022-06-23) -- "Funny-Looking Kid"
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("dada2")
+
+
+library("Rcpp")
+library(dada2); packageVersion("dada2")
+
+```
+
+Set the path to the raw fastq data
+
+```{r}
+path <- "~/Sequences_Dani/" # change it to the directory containing the fastq files after unzipping.
+list.files(path)
+```
+
+Create lists of forward and reverse filenames for the forward and reverse reads and a list of sample names
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq.gz", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+```
+
+Plot a profile of the quality scores for forward and reverse sequences (first two samples)
+
+```{r}
+plotQualityProfile(c(fnFs[1:2],fnRs[1:2]))
+```
+
+Create a list of the filenames (including the path) for the filtered reads
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+Filter and trim the reads in each fastq file
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(249,245),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+out
+```
+
+Learn the error rates for forward and reverse reads
+
+```{r}
+#Learn the Error Rates
+errF <- learnErrors(filtFs, multithread=TRUE)
+#116516313 total bases in 467937 reads from 12 samples will be used for learning the error rates.
+errR <- learnErrors(filtRs, multithread=TRUE)
+#114644565 total bases in 467937 reads from 12 samples will be used for learning the error rates.
+```
+
+Plot the estimated error rates for the transition types
+
+```{r}
+#Visualizing the estimated error rates
+#Plot the estimated error rates for the transition types
+plotErrors(errF, nominalQ = TRUE)
+```
+
+Dereplication
+
+```{r}
+#Dereplication
+# Dereplicate the forward and then the reverse reads
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+Sample inference
+
+Pooling information across samples can increase sensitivity to sequence variants that may be present at very low frequencies in multiple samples. Thus, the option pool = TRUE
+
+```{r}
+#Sample Inference
+dadaFs <- dada(derepFs, err = errF, multithread = 16, pool = TRUE)
+#108 samples were pooled: 6184223 reads in 1432979 unique sequences.
+dadaRs <- dada(derepRs, err = errR, multithread = 16, pool = TRUE)
+#108 samples were pooled: 6184223 reads in 2019192 unique sequences.
+```
+
+Merge paired reads
+
+```{r}
+#Merge paired reads
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE, minOverlap = 12)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+Make the Amplicon Sequence Variant (ASV) table
+
+```{r}
+#Construct sequence table
+seqtab <- makeSequenceTable(mergers)
+# This produces the dimensions of the table, with the rows as samples and columns as ASVs.
+dim(seqtab) #108 170374
+# there are 170374 unique sequences across the dataset
+
+#Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+Remove chimeras from the ASV table
+
+```{r}
+#Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+#Identified 72678 bimeras out of 170374 input sequences.
+dim(seqtab.nochim) # 108 97696
+sum(seqtab.nochim)/sum(seqtab) #0.8520029
+```
+
+Track reads through the pipeline
+
+```{r}
+#Track reads through the pipeline
+getN <- function(x) sum(getUniques(x))
+
+# making a summary table
+summary_tab <- data.frame(row.names = sample.names,
+                          dada2_input = out[,1],
+                          filtered = out[,2],
+                          dada_f = sapply(dadaFs, getN),
+                          dada_r = sapply(dadaRs, getN), 
+                          merged = sapply(mergers, getN),
+                          nonchim = rowSums(seqtab.nochim),
+                          final_perc_reads_retained = round(rowSums(seqtab.nochim) / out[,1] * 100, 1))
+
+summary_tab
+
+# Write the table to a tab-separated values (.tsv) file
+write.table(summary_tab, "Dani-read-count-tracking.tsv", quote=FALSE, sep="\t", col.names=NA)
+```
+
+Assign taxonomy
+
+Here, the GTDB database was used from: DADA2 formatted 16S rRNA gene sequences for both bacteria & archaea (Ali Alishum. (2022). DADA2 formatted 16S rRNA gene sequences for both bacteria & archaea (Version 4.3) [Data set]. Zenodo. <https://doi.org/10.5281/zenodo.6655692>)
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "~/GTDB_bac120_arc53_ssu_r207_Genus.fa.gz", tryRC=TRUE, multithread=TRUE)
+#With allowMultiple=TRUE all exact species matches are reported, separated by backslashes.
+taxa <- addSpecies(taxa, "~/GTDB_bac120_arc53_ssu_r207_Species.fa.gz", allowMultiple = TRUE)
+```
+
+Extracting the standard goods from dada2
+
+1. Fasta file from ASVs
+
+```{r}
+#giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode = "character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep = "_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs_pig-microbiota.fasta")
+```
+
+2. Count table
+
+```{r}
+# count table:
+asv_tab <- t(seqtab.nochim)
+colnames(asv_tab) <- sample.names
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs-counts_pig-microbiota.tsv", sep = "\t", quote = FALSE, col.names = NA)
+
+```
+
+3. Taxa table
+
+```{r}
+# tax table:
+asv_tax <- taxa
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "ASVs-taxonomy_pig-microbiota.tsv", sep="\t", quote=F, col.names=NA)
+```
+
